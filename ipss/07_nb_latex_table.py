@@ -1,0 +1,277 @@
+"""
+07_nb_latex_table.py
+====================
+Produces a LaTeX TABLE and an accompanying forest figure summarising the
+Nadeau-Bengio (NB) analysis stored in the contrasts directory.
+
+Two contrasts are placed side by side so the reader can compare what the test
+says about them: a DVH-index block (selectable segmentation source) and an
+ablation of a clinical variable known to carry signal. Each panel reports the
+patient-level bootstrap CI, which is the reference inference, next to the NB
+p-value.
+
+READ-ONLY on contrasts.csv (produced by 04_contrasts.py). Primary learner
+(PRIMARY_LEARNER). No Holm correction (raw NB p, the NB variance correction
+being kept) - see USE_HOLM in 04_contrasts.py.
+
+Outputs (in the contrasts directory):
+  - <stem>_table.tex   booktabs table ready to \\input.
+  - <stem>_forest.pdf  delta RMSE with bootstrap CI, one panel per contrast
+    and .png           (colour = CI excludes 0; star = NB p < 0.05).
+"""
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from config import PROJECT_DIR, ENDPOINTS as CFG_ENDPOINTS, with_suffix
+
+plt.rc("font", family="serif")
+
+import sys
+
+# The contrasts directory is suffixed by the active run (PIPE_TAG_SUFFIX).
+CONTRAST_DIR = PROJECT_DIR / with_suffix("contrasts")
+CSV = CONTRAST_DIR / "contrasts.csv"
+LEARNER = "elasticnet"                         # see 04_contrasts.PRIMARY_LEARNER
+ALPHA = 0.05
+
+# ------------------------------------------------------------
+# DVH segmentation source shown in the "DVH indices" panel
+# ------------------------------------------------------------
+# Pick a source among DVH_SOURCE_MAP below. Overridable on the command line:
+#   python3 07_nb_latex_table.py <source>
+#   - "manual"       manual segmentation (clinical reference).
+#   - "auto_det"     deterministic automatic segmentation.
+#   - "mc_bayes"     Monte-Carlo Bayesian segmentation, mean of the draws.
+#   - "mc_bayes_var" Monte-Carlo Bayesian, mean plus variance as features.
+DVH_SOURCE = "mc_bayes_var"  # default, overridable on the command line
+
+# key -> (EXACT label in contrasts.csv, displayed name, panel subtitle).
+DVH_SOURCE_MAP = {
+    "manual":       ("M1_manual − M0",
+                     "DVH indices", "manual segmentation"),
+    "auto_det":     ("M1_det_clin0977 − M0",
+                     "DVH indices", "deterministic auto segmentation (clin0977)"),
+    "mc_bayes":     ("M1_bayes_clin0977 − M0",
+                     "DVH indices", "MC Bayesian segmentation — mean (clin0977)"),
+    "mc_bayes_var": ("M1_bayes+var_clin0977 − M0",
+                     "DVH indices",
+                     "MC Bayesian segmentation — mean + variance (clin0977)"),
+}
+
+if len(sys.argv) >= 2:
+    DVH_SOURCE = sys.argv[1]
+if DVH_SOURCE not in DVH_SOURCE_MAP:
+    raise SystemExit(f"Unknown DVH_SOURCE: {DVH_SOURCE!r} "
+                     f"(expected one of: {list(DVH_SOURCE_MAP)})")
+
+# Clinical-variable panel, compared against the selected DVH source.
+IPSS_CONTRAST = ("Pre-tx total IPSS (obstr+irrit ablation)",
+                 "Pre-tx IPSS", "obstructive + irritative ablation")
+
+# Contrasts to display: the selected DVH source, then the pre-treatment IPSS.
+# (EXACT label in contrasts.csv, displayed name, subtitle); order = display order.
+CONTRASTS_TO_SHOW = [DVH_SOURCE_MAP[DVH_SOURCE], IPSS_CONTRAST]
+
+# Order and short label of the endpoints (days after treatment). Derived from
+# config.ENDPOINTS so it follows the active run. Sorted by increasing day.
+ENDPOINT_ORDER = [f"y_{d}d" for d in sorted(CFG_ENDPOINTS)]
+
+
+# ============================================================
+# Loading
+# ============================================================
+def load():
+    df = pd.read_csv(CSV)
+    df = df[df["algo"] == LEARNER].copy()
+    df["ci_excl0"] = (df["boot_ci_lo"] > 0) | (df["boot_ci_hi"] < 0)
+    df["nb_sig"] = df["nb_p"] < ALPHA
+    df["day"] = df["endpoint"].str.strip("y_").str.rstrip("d").astype(int)
+    return df
+
+
+def sub_for(df, label):
+    s = df[df["contrast"] == label].copy()
+    s["_o"] = s["endpoint"].map({e: i for i, e in enumerate(ENDPOINT_ORDER)})
+    return s.sort_values("_o")
+
+
+# ============================================================
+# LaTeX
+# ============================================================
+def _p(p):
+    """p-value formatted in math mode (clean minus sign, threshold < 0.001)."""
+    if pd.isna(p):
+        return "--"
+    return r"$<$0.001" if p < 1e-3 else f"{p:.3f}"
+
+
+def _b(txt, cond):
+    """Bold in TEXT mode (p-values)."""
+    return rf"\textbf{{{txt}}}" if cond else txt
+
+
+def _bm(inner, cond):
+    """Bold in MATH mode: \\textbf does not affect math content, \\boldmath is
+    required. `inner` is the body without the surrounding $ ... $."""
+    return rf"{{\boldmath${inner}$}}" if cond else f"${inner}$"
+
+
+def build_latex(df):
+    L = []
+    L.append(r"% Generated by 07_nb_latex_table.py")
+    L.append(r"% Required preamble: \usepackage{booktabs, amsmath}  "
+             r"(amsmath for \text and \boldmath)")
+    L.append(r"\begin{table}[t]")
+    L.append(r"  \centering")
+    dvh_src_txt = DVH_SOURCE_MAP[DVH_SOURCE][2]
+    L.append(r"  \caption{Paired $\Delta$RMSE contrasts (IPSS points) on the "
+             r"real targets, ElasticNet learner. DVH indices~: " + dvh_src_txt +
+             r". $\Delta$RMSE $=$ "
+             r"RMSE$_\text{without}-$RMSE$_\text{with}$; $>0$ indicates that the "
+             r"tested variable \emph{improves} the prediction. $95\%$ "
+             r"patient-level bootstrap CI (reference inference); $p_\text{NB}$ "
+             r"is the corrected Nadeau--Bengio test over the CV folds, without "
+             r"multiplicity correction. \textbf{Bold}: CI excluding $0$ "
+             r"($\Delta$RMSE) or $p_\text{NB}<0.05$.}")
+    L.append(r"  \label{tab:nb_dvh_" + DVH_SOURCE + r"_vs_ipss}")
+    L.append(r"  \begin{tabular}{l r c c c}")
+    L.append(r"    \toprule")
+    L.append(r"    Endpoint & $\Delta$RMSE & $95\%$ CI & $p_\text{boot}$ & "
+             r"$p_\text{NB}$ \\")
+    for label, name, sub in CONTRASTS_TO_SHOW:
+        s = sub_for(df, label)
+        if s.empty:
+            continue
+        n_ci = int(s["ci_excl0"].sum())
+        n_nb = int(s["nb_sig"].sum())
+        L.append(r"    \midrule")
+        L.append(rf"    \multicolumn{{5}}{{l}}{{\emph{{{name}}} — {sub} "
+                 rf"\hfill\small CI excludes 0: {n_ci}/{len(s)}, "
+                 rf"$p_\text{{NB}}<0.05$: {n_nb}/{len(s)}}} \\")
+        for _, r in s.iterrows():
+            drmse = _bm(f"{r.delta_rmse:.2f}", r.ci_excl0)
+            ci = _bm(f"[{r.boot_ci_lo:.2f},\\,{r.boot_ci_hi:.2f}]", r.ci_excl0)
+            pnb = _b(_p(r.nb_p), r.nb_sig)
+            L.append(rf"    {int(r.day)}~d & {drmse} & {ci} & {_p(r.boot_p)} & "
+                     rf"{pnb} \\")
+    L.append(r"    \bottomrule")
+    L.append(r"  \end{tabular}")
+    L.append(r"\end{table}")
+    return "\n".join(L) + "\n"
+
+
+# ============================================================
+# Forest figure (one panel per contrast, y = endpoints)
+# ============================================================
+C_NULL = "#9aa0a6"      # CI overlaps 0 (no detectable effect)
+C_SIG = "#c0392b"       # CI excludes 0 (credible effect)
+
+
+def build_figure(df):
+    n = len(CONTRASTS_TO_SHOW)
+    fig, axes = plt.subplots(1, n, figsize=(3.1 * n, 3.5), sharey=True)
+    if n == 1:
+        axes = [axes]
+
+    # Shared x scale, so the magnitudes can be compared visually.
+    xmin = xmax = 0.0
+    subs = []
+    for label, name, sub in CONTRASTS_TO_SHOW:
+        s = sub_for(df, label)
+        subs.append((s, name, sub))
+        if not s.empty:
+            xmin = min(xmin, s["boot_ci_lo"].min())
+            xmax = max(xmax, s["boot_ci_hi"].max())
+    pad = 0.05 * (xmax - xmin)
+    xlim = (xmin - pad, xmax + pad)
+
+    y = np.arange(len(ENDPOINT_ORDER))[::-1]
+    day_lbl = [e.strip("y_").rstrip("d") for e in ENDPOINT_ORDER]
+
+    for ax, (s, name, sub) in zip(axes, subs):
+        ax.axvline(0, color="k", lw=0.9, ls="--", alpha=0.6)
+        # Align on ENDPOINT_ORDER.
+        s = s.set_index("endpoint")
+        for yi, ep in zip(y, ENDPOINT_ORDER):
+            if ep not in s.index:
+                continue
+            r = s.loc[ep]
+            col = C_SIG if r["ci_excl0"] else C_NULL
+            ax.hlines(yi, r["boot_ci_lo"], r["boot_ci_hi"], color=col, lw=2.0)
+            # Colour encodes whether the CI excludes 0; a STAR marks NB p < 0.05,
+            # a circle otherwise.
+            if r["nb_sig"]:
+                ax.plot(r["delta_rmse"], yi, marker="*", color=col, ms=13,
+                        mec="white", mew=0.5, zorder=5)
+            else:
+                ax.plot(r["delta_rmse"], yi, marker="o", color=col, ms=5,
+                        zorder=5)
+        ax.set_title(name, fontsize=12, pad=16)
+        ax.set_xlim(*xlim)
+        ax.set_xlabel(r"$\Delta$RMSE (IPSS pts)")
+        ax.grid(axis="x", alpha=0.25)
+
+    axes[0].set_yticks(y)
+    axes[0].set_yticklabels([f"{d} d" for d in day_lbl])
+    axes[0].set_ylabel("Endpoint (days post-treatment)")
+
+    # Shared legend.
+    from matplotlib.lines import Line2D
+    handles = [
+        Line2D([0], [0], color=C_SIG, lw=2, marker="o",
+               label="CI excludes 0 (credible effect)"),
+        Line2D([0], [0], color=C_NULL, lw=2, marker="o",
+               label="CI overlaps 0 (no effect)"),
+        Line2D([0], [0], color="k", lw=0, marker="*", markersize=12,
+               label=r"$p_\mathrm{NB}<0.05$"),
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=3, frameon=False,
+               fontsize=12, bbox_to_anchor=(0.5, -0.02))
+    fig.tight_layout(rect=(0, 0.05, 1, 0.94))
+    return fig
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    if not CSV.exists():
+        raise SystemExit(f"{CSV} not found - run 04_contrasts.py first.")
+    df = load()
+
+    missing = [lab for lab, _, _ in CONTRASTS_TO_SHOW
+               if df[df["contrast"] == lab].empty]
+    if missing:
+        print(f"! Contrasts absent from contrasts.csv (skipped): {missing}")
+
+    # File names are suffixed by the DVH source, so switching source does not
+    # overwrite the outputs of another one.
+    stem = f"nb_dvh_{DVH_SOURCE}_vs_ipss"
+
+    tex = build_latex(df)
+    (CONTRAST_DIR / f"{stem}_table.tex").write_text(tex)
+
+    fig = build_figure(df)
+    fig.savefig(CONTRAST_DIR / f"{stem}_forest.pdf", bbox_inches="tight")
+    fig.savefig(CONTRAST_DIR / f"{stem}_forest.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    # Console summary.
+    print(f"\n=== Summary (ElasticNet learner, raw NB p) - DVH source: "
+          f"{DVH_SOURCE} ===")
+    for label, name, _ in CONTRASTS_TO_SHOW:
+        s = sub_for(df, label)
+        if s.empty:
+            continue
+        print(f"  {name:<26} CI excludes 0: {int(s['ci_excl0'].sum())}/{len(s)}"
+              f"   |   p_NB<0.05: {int(s['nb_sig'].sum())}/{len(s)}")
+    print(f"\n[done] Written to {CONTRAST_DIR}/:")
+    print(f"   {stem}_table.tex")
+    print(f"   {stem}_forest.pdf / .png")
+
+
+if __name__ == "__main__":
+    main()
